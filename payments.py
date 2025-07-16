@@ -1,31 +1,32 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, filters, CallbackQueryHandler, \
+    CommandHandler
+from training_archive import archive_training_after_charge
 from data import load_data, save_data
-from validation import ADMIN_IDS
-from validation import is_authorized
-import os
-from dotenv import load_dotenv
+from validation import ADMIN_IDS, is_authorized
 
-load_dotenv()
-
-TRAINING_COST = os.getenv("TRAINING_COST")
+CHARGE_SELECT_TRAINING, CHARGE_ENTER_AMOUNT = range(100, 102)
 CARD_NUMBER = os.getenv("CARD_NUMBER")
 
 
-async def charge_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def charge_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_authorized(update.message.from_user.id):
+        await update.message.reply_text("⛔ У вас немає прав для цієї команди.")
+        return ConversationHandler.END
+
     one_time_trainings = load_data("one_time_trainings", {})
     constant_trainings = load_data("constant_trainings", {})
 
     options = []
     for tid, t in one_time_trainings.items():
-        if t.get("status") == "not charged" and t.get("with_coach"):
+        if t.get("status") == "not charged":
             date = t["date"]
             time = f"{t['start_hour']:02d}:{t['start_min']:02d}"
             label = f"{date} о {time}"
             options.append((tid, "one_time", label))
 
     for tid, t in constant_trainings.items():
-        if t.get("status") == "not charged" and t.get("with_coach"):
+        if t.get("status") == "not charged":
             weekday = t["weekday"]
             time = f"{t['start_hour']:02d}:{t['start_min']:02d}"
             day = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"][weekday]
@@ -34,7 +35,7 @@ async def charge_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not options:
         await update.message.reply_text("Немає тренувань, які потребують нарахування платежів.")
-        return
+        return ConversationHandler.END
 
     context.user_data["charge_options"] = options
     keyboard = [
@@ -47,23 +48,53 @@ async def charge_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+    return CHARGE_SELECT_TRAINING
 
-async def handle_charge_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def handle_charge_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
     idx = int(query.data.replace("charge_select_", ""))
     options = context.user_data.get("charge_options", [])
+
     if idx >= len(options):
         await query.edit_message_text("Помилка: тренування не знайдено.")
-        return
+        return ConversationHandler.END
 
     tid, ttype, label = options[idx]
+    context.user_data["selected_training"] = (tid, ttype, label)
+
+    await query.edit_message_text(
+        f"Ви обрали тренування: {label}\n\n"
+        "Введіть суму для цього тренування:\n"
+        "Наприклад: 150"
+    )
+
+    return CHARGE_ENTER_AMOUNT
+
+
+async def handle_charge_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if "selected_training" not in context.user_data:
+        await update.message.reply_text("⚠️ Помилка: дані про тренування втрачено. Спробуйте /charge_all знову.")
+        return ConversationHandler.END
+
+    try:
+        amount = int(update.message.text.strip())
+        if amount <= 0:
+            await update.message.reply_text("⚠️ Сума повинна бути більше 0. Спробуйте ще раз:")
+            return CHARGE_ENTER_AMOUNT
+    except ValueError:
+        await update.message.reply_text("⚠️ Будь ласка, введіть число. Спробуйте ще раз:")
+        return CHARGE_ENTER_AMOUNT
+
+    tid, ttype, label = context.user_data["selected_training"]
+
     trainings = load_data("one_time_trainings" if ttype == "one_time" else "constant_trainings")
     training = trainings.get(tid)
     if not training:
-        await query.edit_message_text("Тренування не знайдено.")
-        return
+        await update.message.reply_text("Тренування не знайдено.")
+        return ConversationHandler.END
 
     votes = load_data("votes", {"votes": {}})["votes"]
     training_id = (
@@ -73,26 +104,16 @@ async def handle_charge_selection(update: Update, context: ContextTypes.DEFAULT_
     )
 
     if training_id not in votes:
-        await query.edit_message_text("Ніхто не голосував за це тренування.")
-        return
+        await update.message.reply_text("Ніхто не голосував за це тренування.")
+        return ConversationHandler.END
 
     voters = votes[training_id]
     yes_voters = [uid for uid, v in voters.items() if v["vote"] == "yes"]
     if not yes_voters:
-        await query.edit_message_text("Ніхто не проголосував 'так' за це тренування.")
-        return
+        await update.message.reply_text("Ніхто не проголосував 'так' за це тренування.")
+        return ConversationHandler.END
 
-    is_fixed_cost = (
-            ttype == "constant" and
-            training.get("weekday") == 0 and
-            training.get("start_hour") == 17 and
-            training.get("start_min") == 00
-    )
-
-    if is_fixed_cost:
-        per_person = round(1750 / len(yes_voters))
-    else:
-        per_person = round(TRAINING_COST / len(yes_voters))
+    per_person = round(amount / len(yes_voters))
     training_datetime = (
         f"{training['date']} {training['start_hour']:02d}:{training['start_min']:02d}"
         if ttype == "one_time"
@@ -100,53 +121,73 @@ async def handle_charge_selection(update: Update, context: ContextTypes.DEFAULT_
     )
 
     payments = load_data("payments", {})
+    success_count = 0
 
     for uid in yes_voters:
-        new_entry = {
+        payment_key = f"{training_id}_{uid}"
+        payments[payment_key] = {
             "user_id": uid,
             "training_id": training_id,
             "amount": per_person,
+            "total_training_cost": amount,
             "training_datetime": training_datetime,
             "card": CARD_NUMBER,
             "paid": False
         }
-        payments[f"{training_id}_{uid}"] = new_entry
 
-        keyboard = [
-            [InlineKeyboardButton("✅ Я оплатив(ла)", callback_data=f"paid_yes_{training_id}_{uid}")]
-        ]
-
+        keyboard = [[InlineKeyboardButton("✅ Я оплатив(ла)", callback_data=f"paid_yes_{training_id}_{uid}")]]
         try:
             await context.bot.send_message(
                 chat_id=int(uid),
                 text=(f"💳 Ти відвідав(-ла) тренування {training_datetime}.\n"
                       f"Сума до сплати: {per_person} грн\n"
-                      f"Карта для оплати: {CARD_NUMBER}\n\n"
+                      f"Карта для оплати: `{CARD_NUMBER}`\n\n"
                       f"Натисни кнопку нижче, коли оплатиш:"),
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
+            success_count += 1
         except Exception as e:
             print(f"❌ Помилка надсилання повідомлення для {uid}: {e}")
 
     save_data(payments, "payments")
     trainings[tid]["status"] = "charged"
+    trainings[tid]["voting_opened"] = False
     save_data(trainings, "one_time_trainings" if ttype == "one_time" else "constant_trainings")
 
-    await query.edit_message_text("✅ Повідомлення з інструкцією надіслано всім, хто голосував 'так'.")
+    try:
+        archive_success = archive_training_after_charge(training_id, ttype)
+        if archive_success:
+            print(f"✅ Training {training_id} archived successfully")
+        else:
+            print(f"⚠️ Failed to archive training {training_id}")
+    except Exception as e:
+        print(f"❌ Error archiving training {training_id}: {e}")
+
+    await update.message.reply_text(
+        f"✅ Нарахування завершено!\n"
+        f"💰 Загальна сума: {amount} грн\n"
+        f"👥 Учасників: {len(yes_voters)}\n"
+        f"💵 По {per_person} грн з особи\n"
+        f"📤 Повідомлення надіслано {success_count} учасникам"
+    )
+
+    return ConversationHandler.END
 
 
 async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    parts = query.data.split("_")
-    training_id, user_id = parts[2], parts[3]
+    payload = query.data[len("paid_yes_"):]
+    training_id, user_id = payload.rsplit("_", 1)
 
     payments = load_data("payments", {})
     key = f"{training_id}_{user_id}"
 
     if key not in payments:
-        await query.edit_message_text("⚠️ Помилка: запис про платіж не знайдено.")
+        await query.edit_message_text(
+            "⚠️ Помилка: запис про платіж не знайдено. Використай команду /pay_debt для підтвердження")
         return
 
     payments[key]["paid"] = True
@@ -179,6 +220,11 @@ async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFA
                     return
 
 
+async def cancel_charge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Нарахування скасовано.")
+    return ConversationHandler.END
+
+
 async def pay_debt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.message.from_user.id)
     payments = load_data("payments", {})
@@ -199,8 +245,9 @@ async def pay_debt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
 
     await update.message.reply_text(
-        "Оберіть тренування для підтвердження оплати:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        f"Карта: `{CARD_NUMBER}`\nОберіть тренування для підтвердження оплати:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
     )
 
 
@@ -248,6 +295,7 @@ async def handle_pay_debt_confirmation(update: Update, context: ContextTypes.DEF
     save_data(payments, "payments")
     await query.edit_message_text("✅ Дякуємо! Оплату зареєстровано.")
 
+    # Optional: Check if all paid -> notify admins
     training_id = selected["training_id"]
     all_paid = all(p["paid"] for p in payments.values() if p["training_id"] == training_id)
     if all_paid:
@@ -336,3 +384,35 @@ async def handle_view_payment_selection(update: Update, context: ContextTypes.DE
     message += f"❌ Не оплатили:\n{chr(10).join(unpaid) if unpaid else 'Немає боржників'}"
 
     await query.edit_message_text(message)
+
+
+def create_charge_conversation_handler():
+    return ConversationHandler(
+        entry_points=[CommandHandler("charge_all", charge_all)],
+        states={
+            CHARGE_SELECT_TRAINING: [
+                CallbackQueryHandler(handle_charge_selection, pattern=r"^charge_select_\d+$")
+            ],
+            CHARGE_ENTER_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_charge_amount_input)
+            ],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel_charge)
+        ],
+    )
+
+
+def setup_payment_handlers(app):
+    # /pay_debt
+    app.add_handler(CommandHandler("pay_debt", pay_debt))
+    # Admin: /charge_all
+    app.add_handler(create_charge_conversation_handler())
+    # Admin: /view_payments
+    app.add_handler(CommandHandler("view_payments", view_payments))
+
+    # Other
+    app.add_handler(CallbackQueryHandler(handle_payment_confirmation, pattern=r"^paid_yes_.*"))
+    app.add_handler(CallbackQueryHandler(handle_pay_debt_selection, pattern=r"^paydebt_select_\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_pay_debt_confirmation, pattern=r"^paydebt_confirm_yes$"))
+    app.add_handler(CallbackQueryHandler(handle_view_payment_selection, pattern=r"^view_payment_\d+"))
